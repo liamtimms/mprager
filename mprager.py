@@ -1,7 +1,8 @@
-#!/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import os
+import warnings
 
 import numpy as np
 import SimpleITK as sitk
@@ -85,6 +86,27 @@ def validate_args(args: argparse.Namespace):
         raise FileExistsError(f"Mask output file already exists: {args.mask}")
 
 
+def resample_to_reference(
+    image: sitk.Image,
+    reference: sitk.Image,
+    interpolator=sitk.sitkNearestNeighbor,
+) -> sitk.Image:
+    """Resample image into the physical space of reference."""
+    return sitk.Resample(
+        image, reference, sitk.Transform(), interpolator, 0.0, image.GetPixelID()
+    )
+
+
+def same_space(a: sitk.Image, b: sitk.Image) -> bool:
+    """Return True if two images share the same grid (size, spacing, origin, direction)."""
+    return (
+        a.GetSize() == b.GetSize()
+        and a.GetSpacing() == b.GetSpacing()
+        and a.GetOrigin() == b.GetOrigin()
+        and a.GetDirection() == b.GetDirection()
+    )
+
+
 def threshold_image(img: sitk.Image, strategy: str) -> sitk.Image:
     """Return a binary brain mask using the chosen thresholding strategy."""
     if strategy == "li":
@@ -113,13 +135,35 @@ def main():
     uni_img = sitk.ReadImage(args.uni)
     uni_img = sitk.Cast(uni_img, sitk.sitkFloat32)
 
+    # UNI and INV2 must share a grid for the final Multiply. In a standard
+    # MP2RAGE acquisition they always do; warn and resample if they don't.
+    if not same_space(uni_img, inv2_img):
+        warnings.warn(
+            f"UNI image grid {uni_img.GetSize()} differs from INV2 {inv2_img.GetSize()}; "
+            "resampling UNI to INV2 space with linear interpolation.",
+            stacklevel=2,
+        )
+        uni_img = resample_to_reference(uni_img, inv2_img, sitk.sitkLinear)
+
     # Determine the mask to use for bias-field correction.
     # If the user supplied a pre-existing mask, load and use it directly.
-    # Otherwise, compute one from INV2 using the selected thresholding strategy.
+    # Otherwise, compute and clean one from INV2 using the selected thresholding strategy.
     if args.input_mask is not None:
         bias_mask = sitk.ReadImage(args.input_mask)
+        # Resample to INV2 space if the mask came from an external tool with a
+        # different grid (e.g. BET run at a different resolution).
+        if not same_space(bias_mask, inv2_img):
+            warnings.warn(
+                f"Input mask grid {bias_mask.GetSize()} differs from INV2 {inv2_img.GetSize()}; "
+                "resampling mask to INV2 space with nearest-neighbour interpolation.",
+                stacklevel=2,
+            )
+            bias_mask = resample_to_reference(bias_mask, inv2_img)
     else:
-        bias_mask = threshold_image(inv2_img, args.mask_strategy)
+        raw_mask = threshold_image(inv2_img, args.mask_strategy)
+        mask_arr = clean_mask(sitk.GetArrayFromImage(raw_mask))
+        bias_mask = sitk.GetImageFromArray(mask_arr.astype(np.uint8))
+        bias_mask.CopyInformation(raw_mask)
 
     # Shrink images for faster N4 bias field correction, then reconstruct at full res
     shrunk_img = sitk.Shrink(inv2_img, [2] * inv2_img.GetDimension())

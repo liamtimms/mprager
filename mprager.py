@@ -38,15 +38,8 @@ def get_args() -> argparse.Namespace:
         "-m",
         "--mask",
         type=str,
-        help="Path to save the brain mask image",
+        help="Path to save the brain mask used during processing",
         default=None,
-    )
-    parser.add_argument(
-        "--mask-strategy",
-        type=str,
-        choices=["li", "otsu"],
-        default="li",
-        help="Thresholding strategy used to generate the brain mask (default: li)",
     )
     parser.add_argument(
         "-f",
@@ -54,24 +47,42 @@ def get_args() -> argparse.Namespace:
         action="store_true",
         help="Force overwrite of output files",
     )
+
+    # Mask source: provide an existing mask OR let the script compute one via thresholding.
+    mask_source = parser.add_mutually_exclusive_group()
+    mask_source.add_argument(
+        "--input-mask",
+        type=str,
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to a pre-existing brain mask. "
+            "When provided, thresholding is skipped and this mask is used directly "
+            "for bias-field correction and as the output mask."
+        ),
+    )
+    mask_source.add_argument(
+        "--mask-strategy",
+        type=str,
+        choices=["li", "otsu"],
+        default="li",
+        help="Thresholding strategy used to compute the brain mask automatically (default: li)",
+    )
+
     return parser.parse_args()
 
 
-def validate_fnames(
-    inv2_fname: str,
-    uni_fname: str,
-    output_fname: str,
-    mask_fname: str,
-    force: bool,
-):
-    if not os.path.exists(inv2_fname):
-        raise FileNotFoundError(f"INV2 image not found: {inv2_fname}")
-    if not os.path.exists(uni_fname):
-        raise FileNotFoundError(f"UNI image not found: {uni_fname}")
-    if not force and os.path.exists(output_fname):
-        raise FileExistsError(f"Output file already exists: {output_fname}")
-    if mask_fname is not None and os.path.exists(mask_fname) and not force:
-        raise FileExistsError(f"Mask file already exists: {mask_fname}")
+def validate_args(args: argparse.Namespace):
+    if not os.path.exists(args.inv2):
+        raise FileNotFoundError(f"INV2 image not found: {args.inv2}")
+    if not os.path.exists(args.uni):
+        raise FileNotFoundError(f"UNI image not found: {args.uni}")
+    if args.input_mask is not None and not os.path.exists(args.input_mask):
+        raise FileNotFoundError(f"Input mask not found: {args.input_mask}")
+    if not args.force and os.path.exists(args.output):
+        raise FileExistsError(f"Output file already exists: {args.output}")
+    if args.mask is not None and os.path.exists(args.mask) and not args.force:
+        raise FileExistsError(f"Mask output file already exists: {args.mask}")
 
 
 def threshold_image(img: sitk.Image, strategy: str) -> sitk.Image:
@@ -92,27 +103,27 @@ def clean_mask(mask: NDArray, min_size: int = 100) -> NDArray:
 
 def main():
     args: argparse.Namespace = get_args()
-    validate_fnames(
-        args.inv2,
-        args.uni,
-        args.output,
-        args.mask,
-        args.force,
-    )
+    validate_args(args)
+
     # Load and normalise INV2
     inv2_img = sitk.ReadImage(args.inv2)
     inv2_img = sitk.Cast(inv2_img, sitk.sitkFloat32)
     inv2_img = sitk.RescaleIntensity(inv2_img, 0, 255)
 
-    # Initial brain mask from INV2 (used to guide bias field correction)
-    init_mask = threshold_image(inv2_img, args.mask_strategy)
-
     uni_img = sitk.ReadImage(args.uni)
     uni_img = sitk.Cast(uni_img, sitk.sitkFloat32)
 
+    # Determine the mask to use for bias-field correction.
+    # If the user supplied a pre-existing mask, load and use it directly.
+    # Otherwise, compute one from INV2 using the selected thresholding strategy.
+    if args.input_mask is not None:
+        bias_mask = sitk.ReadImage(args.input_mask)
+    else:
+        bias_mask = threshold_image(inv2_img, args.mask_strategy)
+
     # Shrink images for faster N4 bias field correction, then reconstruct at full res
     shrunk_img = sitk.Shrink(inv2_img, [2] * inv2_img.GetDimension())
-    mask_shrink = sitk.Shrink(init_mask, [2] * init_mask.GetDimension())
+    mask_shrink = sitk.Shrink(bias_mask, [2] * bias_mask.GetDimension())
 
     bias_corrector = sitk.N4BiasFieldCorrectionImageFilter()
     bias_corrector.Execute(shrunk_img, mask_shrink)
@@ -124,13 +135,18 @@ def main():
     mprage_img = sitk.Cast(mprage_img, sitk.sitkFloat32)
     sitk.WriteImage(mprage_img, args.output)
 
-    # Derive final brain mask from the MPRAGE output and write if requested
+    # Save the mask used/computed during processing if an output path was given.
     if args.mask is not None:
-        mask = threshold_image(mprage_img, args.mask_strategy)
-        mask_arr = clean_mask(sitk.GetArrayFromImage(mask))
-        mask_mod = sitk.GetImageFromArray(mask_arr.astype(np.uint8))
-        mask_mod.CopyInformation(mask)
-        sitk.WriteImage(mask_mod, args.mask)
+        if args.input_mask is not None:
+            # User supplied their own mask — write it through unchanged.
+            sitk.WriteImage(bias_mask, args.mask)
+        else:
+            # Derive a clean final mask from the MPRAGE output via thresholding.
+            mask = threshold_image(mprage_img, args.mask_strategy)
+            mask_arr = clean_mask(sitk.GetArrayFromImage(mask))
+            mask_mod = sitk.GetImageFromArray(mask_arr.astype(np.uint8))
+            mask_mod.CopyInformation(mask)
+            sitk.WriteImage(mask_mod, args.mask)
 
 
 if __name__ == "__main__":
